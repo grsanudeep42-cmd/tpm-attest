@@ -1,0 +1,25 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment / secrets
+.env
+.env.*
+
+# TPM key material — NEVER commit these
+*.ctx
+*.pub
+*.priv
+
+# Temporary TPM quote artefacts
+/tmp/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

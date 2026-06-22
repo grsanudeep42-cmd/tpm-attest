@@ -1,0 +1,14 @@
+# Cryptography — signing, hashing, key management
+cryptography>=42.0.0
+
+# Server
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+
+# HTTP client (agent → server transport)
+requests>=2.32.0
+
+# NOTE: TPM2 access is done by shelling out to tpm2-tools (tpm2_pcrread, etc.)
+# Install tpm2-tools on the host OS:
+#   Debian/Ubuntu: sudo apt install tpm2-tools
+#   Fedora/RHEL:   sudo dnf install tpm2-tools
