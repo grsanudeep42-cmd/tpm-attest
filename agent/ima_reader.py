@@ -26,12 +26,28 @@ Public API
             modules_measured  – count of entries whose filename ends in
                                 .ko or .ko.zst
 
+    build_ima_merkle_tree(entries) -> dict
+        Builds a binary Merkle tree over the IMA entries and returns:
+            root        – hex root hash (32 bytes / 64 hex chars)
+            depth       – number of levels in the tree (0 for empty log)
+            leaf_count  – number of leaf nodes (== len(entries))
+            leaves      – list of hex leaf hashes
+
+    get_ima_proof(entries, index) -> dict
+        Returns the Merkle inclusion proof for the entry at *index*:
+            index       – the requested index
+            leaf_hash   – hex hash of the leaf
+            proof       – ordered list of sibling hex hashes (bottom → root)
+            root        – hex root hash
+
 Example log line
 ----------------
     10 3bee321a... ima-ng sha256:86a4e2c9... /path/to/file
 """
 
+import hashlib
 import json
+import math
 import subprocess
 
 _IMA_LOG_PATH = "/sys/kernel/security/ima/ascii_runtime_measurements"
@@ -96,6 +112,166 @@ def read_ima_log() -> list[dict]:
     return entries
 
 
+# ---------------------------------------------------------------------------
+# Merkle tree helpers
+# ---------------------------------------------------------------------------
+
+def _sha256(data: bytes) -> bytes:
+    """Return the raw 32-byte SHA-256 digest of *data*."""
+    return hashlib.sha256(data).digest()
+
+
+def _leaf_hash(entry: dict) -> bytes:
+    """Compute the canonical leaf hash for a single IMA entry.
+
+    The pre-image is the UTF-8 encoding of::
+
+        "<pcr>:<template_hash>:<file_hash>:<filename>"
+    """
+    pre_image = (
+        f"{entry['pcr']}:{entry['template_hash']}"
+        f":{entry['file_hash']}:{entry['filename']}"
+    ).encode()
+    return _sha256(pre_image)
+
+
+def build_ima_merkle_tree(entries: list[dict]) -> dict:
+    """Build a binary Merkle tree over *entries* and return tree metadata.
+
+    Algorithm
+    ---------
+    1. Hash each entry with :func:`_leaf_hash` to produce the leaf layer.
+    2. Repeatedly hash adjacent pairs — SHA-256(left_raw || right_raw) — to
+       produce the next layer.  When the current layer has an odd number of
+       nodes the last node is duplicated before pairing.
+    3. The single node that remains after all reductions is the root.
+
+    An empty *entries* list produces a zero-filled root and depth 0.
+
+    Parameters
+    ----------
+    entries:
+        List of entry dicts as returned by :func:`read_ima_log`.
+
+    Returns
+    -------
+    dict
+        ``root``       – 64-char hex root hash
+        ``depth``      – number of levels in the tree (leaves = level 0)
+        ``leaf_count`` – number of leaf hashes
+        ``leaves``     – list of 64-char hex leaf hashes
+    """
+    if not entries:
+        return {
+            "root": hashlib.sha256(b"").hexdigest(),
+            "depth": 0,
+            "leaf_count": 0,
+            "leaves": [],
+        }
+
+    # --- leaf layer ---
+    leaf_raw: list[bytes] = [_leaf_hash(e) for e in entries]
+    leaves_hex: list[str] = [b.hex() for b in leaf_raw]
+
+    # --- iteratively reduce to root ---
+    current_layer: list[bytes] = leaf_raw
+    depth = 0
+    while len(current_layer) > 1:
+        # Duplicate the last node when the layer length is odd
+        if len(current_layer) % 2 == 1:
+            current_layer.append(current_layer[-1])
+        next_layer: list[bytes] = [
+            _sha256(current_layer[i] + current_layer[i + 1])
+            for i in range(0, len(current_layer), 2)
+        ]
+        current_layer = next_layer
+        depth += 1
+
+    root_hex = current_layer[0].hex()
+
+    return {
+        "root": root_hex,
+        "depth": depth,
+        "leaf_count": len(leaf_raw),
+        "leaves": leaves_hex,
+    }
+
+
+def get_ima_proof(entries: list[dict], index: int) -> dict:
+    """Return the Merkle inclusion proof for the entry at *index*.
+
+    The proof is the ordered list of sibling hashes needed for a verifier to
+    recompute the root from the leaf — one hash per tree level, ordered from
+    the leaf level up to (but not including) the root level.
+
+    Parameters
+    ----------
+    entries:
+        List of entry dicts as returned by :func:`read_ima_log`.
+    index:
+        Zero-based position of the entry whose proof is requested.
+
+    Returns
+    -------
+    dict
+        ``index``     – the requested index
+        ``leaf_hash`` – 64-char hex hash of the leaf at *index*
+        ``proof``     – list of 64-char hex sibling hashes (bottom → root)
+        ``root``      – 64-char hex root hash
+
+    Raises
+    ------
+    IndexError
+        If *index* is out of range for *entries*.
+    ValueError
+        If *entries* is empty.
+    """
+    if not entries:
+        raise ValueError("Cannot produce a proof for an empty entry list.")
+    if not (0 <= index < len(entries)):
+        raise IndexError(
+            f"Index {index} is out of range for {len(entries)} entries."
+        )
+
+    # Build the full tree layer-by-layer, recording every layer so we can
+    # walk back up and collect sibling hashes.
+    current_layer: list[bytes] = [_leaf_hash(e) for e in entries]
+    leaf_hash_hex = current_layer[index].hex()
+
+    proof: list[str] = []
+    current_index = index
+
+    while len(current_layer) > 1:
+        # Duplicate last node for odd-length layers
+        if len(current_layer) % 2 == 1:
+            current_layer.append(current_layer[-1])
+
+        # Determine the sibling index
+        if current_index % 2 == 0:          # current node is a left child
+            sibling_index = current_index + 1
+        else:                               # current node is a right child
+            sibling_index = current_index - 1
+
+        proof.append(current_layer[sibling_index].hex())
+
+        # Build next layer
+        next_layer: list[bytes] = [
+            _sha256(current_layer[i] + current_layer[i + 1])
+            for i in range(0, len(current_layer), 2)
+        ]
+        current_layer = next_layer
+        current_index //= 2
+
+    root_hex = current_layer[0].hex()
+
+    return {
+        "index": index,
+        "leaf_hash": leaf_hash_hex,
+        "proof": proof,
+        "root": root_hex,
+    }
+
+
 def read_ima_summary() -> dict:
     """Return a high-level summary of the IMA runtime measurement log.
 
@@ -136,4 +312,15 @@ def read_ima_summary() -> dict:
 
 
 if __name__ == "__main__":
-    print(json.dumps(read_ima_summary(), indent=2))
+    _entries = read_ima_log()
+    _summary = read_ima_summary()
+    _tree = build_ima_merkle_tree(_entries)
+    print(json.dumps(
+        {
+            "ima_summary": _summary,
+            "merkle_root": _tree["root"],
+            "merkle_depth": _tree["depth"],
+            "merkle_leaf_count": _tree["leaf_count"],
+        },
+        indent=2,
+    ))

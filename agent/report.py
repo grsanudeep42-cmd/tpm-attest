@@ -11,20 +11,23 @@ without a quote and ``quote_available`` is set to False.
 Public API
 ----------
     generate_report() -> dict
-        Collects PCR values, IMA log, IMA summary, and an optional TPM quote,
-        then returns a single dict suitable for JSON serialisation.
+        Collects PCR values, IMA Merkle tree metadata, IMA summary, and an
+        optional TPM quote, then returns a single dict suitable for JSON
+        serialisation.
 
 Report fields
 -------------
-    version          : "1.0"
-    timestamp        : ISO 8601 UTC datetime string
-    nonce            : 64-char hex string (32 random bytes)
-    pcrs             : dict[int, str]  – from read_pcrs()
-    ima_summary      : dict            – from read_ima_summary()
-    ima_log          : list[dict]      – from read_ima_log()
-    quote_available  : bool
-    quote_msg_b64    : base64 string or null
-    quote_sig_b64    : base64 string or null
+    version           : "1.0"
+    timestamp         : ISO 8601 UTC datetime string
+    nonce             : 64-char hex string (32 random bytes)
+    pcrs              : dict[int, str]  – from read_pcrs()
+    ima_summary       : dict            – from read_ima_summary()
+    ima_merkle_root   : str             – 64-char hex Merkle root hash
+    ima_merkle_depth  : int             – tree depth (log2 of leaf count)
+    ima_leaf_count    : int             – number of IMA entries measured
+    quote_available   : bool
+    quote_msg_b64     : base64 string or null
+    quote_sig_b64     : base64 string or null
 """
 
 import base64
@@ -33,7 +36,7 @@ import secrets
 import subprocess
 from datetime import datetime, timezone
 
-from agent.ima_reader import read_ima_log, read_ima_summary
+from agent.ima_reader import build_ima_merkle_tree, read_ima_log, read_ima_summary
 from agent.pcr_reader import read_pcrs
 
 # Persistent key handle created during provisioning (tpm2_createprimary / evictcontrol)
@@ -111,7 +114,8 @@ def generate_report() -> dict:
 
     pcrs = read_pcrs()
     ima_summary = read_ima_summary()
-    ima_log = read_ima_log()
+    ima_entries = read_ima_log()
+    ima_tree = build_ima_merkle_tree(ima_entries)
 
     quote_available, quote_msg_b64, quote_sig_b64 = _run_tpm_quote(nonce)
 
@@ -121,7 +125,9 @@ def generate_report() -> dict:
         "nonce": nonce,
         "pcrs": pcrs,
         "ima_summary": ima_summary,
-        "ima_log": ima_log,
+        "ima_merkle_root": ima_tree["root"],
+        "ima_merkle_depth": ima_tree["depth"],
+        "ima_leaf_count": ima_tree["leaf_count"],
         "quote_available": quote_available,
         "quote_msg_b64": quote_msg_b64,
         "quote_sig_b64": quote_sig_b64,
@@ -130,6 +136,4 @@ def generate_report() -> dict:
 
 if __name__ == "__main__":
     report = generate_report()
-    # Omit ima_log from console output — it can be thousands of entries long
-    display = {k: v for k, v in report.items() if k != "ima_log"}
-    print(json.dumps(display, indent=2))
+    print(json.dumps(report, indent=2))
