@@ -19,6 +19,12 @@ or via the __main__ block:
     python -m server.main
 """
 
+import base64
+import logging
+import os
+import shutil
+import subprocess
+import tempfile
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -27,6 +33,8 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Known-good PCR baseline (placeholder — populate before deploying)
@@ -79,6 +87,94 @@ app = FastAPI(title="TPM Attestation Server", version="1.0")
 _ZERO_DIGEST_PREFIX = "0x" + "0" * 64  # 32-byte all-zero sha256
 
 
+# ---------------------------------------------------------------------------
+# Quote signature verification
+# ---------------------------------------------------------------------------
+
+_AK_HANDLE = "0x81000000"
+
+
+def _verify_quote_signature(report: "AttestationReport") -> str | None:
+    """Verify the TPM quote signature with tpm2_checkquote.
+
+    Steps
+    -----
+    1. Decode ``quote_msg_b64`` and ``quote_sig_b64`` from base64, write to
+       temporary files inside a mode-0700 directory.
+    2. Export the AK public key via ``tpm2_readpublic -c 0x81000000``.
+    3. Run ``tpm2_checkquote`` against the files and the report nonce.
+    4. Clean up the temp directory regardless of outcome.
+
+    Returns
+    -------
+    str | None
+        None on success, or a human-readable failure reason string.
+    """
+    if not report.quote_msg_b64 or not report.quote_sig_b64:
+        return "quote_available is true but quote blobs are missing"
+
+    tmpdir = tempfile.mkdtemp()
+    os.chmod(tmpdir, 0o700)
+
+    try:
+        msg_path = os.path.join(tmpdir, "quote.msg")
+        sig_path = os.path.join(tmpdir, "quote.sig")
+        ak_pub_path = os.path.join(tmpdir, "ak.pub")
+
+        # Write decoded blobs
+        with open(msg_path, "wb") as fh:
+            fh.write(base64.b64decode(report.quote_msg_b64))
+        with open(sig_path, "wb") as fh:
+            fh.write(base64.b64decode(report.quote_sig_b64))
+
+        # Export AK public key from the persistent handle
+        read_pub = subprocess.run(
+            ["tpm2_readpublic", "-c", _AK_HANDLE, "-o", ak_pub_path],
+            capture_output=True,
+            text=True,
+        )
+        if read_pub.returncode != 0:
+            log.error(
+                "tpm2_readpublic failed (rc=%d): %s",
+                read_pub.returncode,
+                read_pub.stderr.strip(),
+            )
+            return "quote signature verification failed"
+
+        # Verify the quote
+        check = subprocess.run(
+            [
+                "tpm2_checkquote",
+                "-u", ak_pub_path,
+                "-m", msg_path,
+                "-s", sig_path,
+                "-q", report.nonce,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if check.returncode != 0:
+            log.error(
+                "tpm2_checkquote failed (rc=%d): %s",
+                check.returncode,
+                check.stderr.strip(),
+            )
+            return "quote signature verification failed"
+
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Unexpected error during quote verification: %s", exc)
+        return "quote signature verification failed"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    return None  # signature valid
+
+
+# ---------------------------------------------------------------------------
+# Full report verification
+# ---------------------------------------------------------------------------
+
+
 def _verify_report(report: AttestationReport) -> str | None:
     """Run all attestation checks on *report*.
 
@@ -89,6 +185,11 @@ def _verify_report(report: AttestationReport) -> str | None:
     # 1. Quote must be present
     if not report.quote_available:
         return "TPM quote not available; attestation requires a provisioned key"
+
+    # 1a. Verify the TPM quote signature
+    sig_failure = _verify_quote_signature(report)
+    if sig_failure:
+        return sig_failure
 
     # 2. Timestamp freshness — replay protection
     try:
