@@ -19,7 +19,7 @@ To break this impasse, we propose a paradigm shift: replacing active runtime mem
 
 By combining TPM 2.0 with the Linux kernel's native Integrity Measurement Architecture (IMA), we can create an immutable, append-only log of every binary, library, and kernel module loaded since system boot. When a game client attempts to establish a session, it must present a hardware-signed TPM quote containing a digest of the system configuration and the runtime execution log. A remote verification server validates this quote against a known-good baseline, ensuring that the system is running an un-tampered kernel, is operating under a secure boot policy, and has not loaded known cheat tools. If the verification succeeds, the server issues a short-lived cryptographically signed session token that the game client forwards to the game server to authorize entry.
 
-This remote attestation model is strictly stronger than the traditional kernel module approach. A kernel module running on a compromised OS can be blinded or modified by sophisticated kernel-level cheats or hypervisors. Conversely, a TPM chip operates independently of the host CPU and memory space. Because the TPM registers (Platform Configuration Registers, or PCRs) can only be modified via one-way cryptographic extension operations, it is mathematically impossible for an adversary—even one with full root privileges—to roll back the state of the PCRs or forge a quote signature. This paper outlines the architecture, design, and evaluation of TPM-Attest, demonstrating a viable, high-security path forward for Linux gaming and trusted distributed systems.
+TPM-Attest provides stronger guarantees for platform integrity and boot-chain verification. Kernel-level anti-cheat systems may provide stronger visibility into runtime memory manipulation — detecting aimbots, memory editing, and DMA-based cheats. The approaches are therefore complementary rather than universally superior. A kernel module running on a compromised OS can be blinded or modified by sophisticated kernel-level cheats or hypervisors. Conversely, a TPM chip operates independently of the host CPU and memory space. Because the TPM registers (Platform Configuration Registers, or PCRs) can only be modified via one-way cryptographic extension operations, it is mathematically impossible for an adversary—even one with full root privileges—to roll back the state of the PCRs or forge a quote signature. This paper outlines the architecture, design, and evaluation of TPM-Attest, demonstrating a viable, high-security path forward for Linux gaming and trusted distributed systems.
 
 ---
 
@@ -220,7 +220,7 @@ The local daemon `shim.py` listens on the socket. When a connection is accepted,
 
 ## 6. Evaluation
 
-To validate the security and performance of TPM-Attest, we conducted six tests covering various attack scenarios and operational modes. Tests were performed on a system running Linux with a TPM 2.0 chip and a remote verification server.
+To validate the security and performance of TPM-Attest, we conducted six tests covering various attack scenarios and operational modes. Evaluation was performed using two TPM implementations: Intel PTT firmware TPM on physical hardware and swtpm in a virtualized environment. Testing across discrete TPM vendors (Infineon, Nuvoton, STMicroelectronics) remains future work.
 
 ### Test 1: Tamper Detection (Forged Quote Signature)
 In this test, we simulated an attacker attempting to modify the signed PCR values inside the report's `quote_msg_b64` payload while keeping the signature intact, or submitting a forged signature. The report was posted to the server.
@@ -236,7 +236,7 @@ To test replay protection, we captured a valid attestation report generated from
 
 ### Test 4: Valid Local Attestation
 We ran the pipeline on a clean, local system where the agent and server were running on the same host, using the local TPM key handle.
-- **Result:** The signature verified successfully, the PCR values matched the baseline, and the server returned HTTP Status Code `200 OK` with a JSON payload containing the validation flag and a new session token:
+- **Result:** The signature verified successfully, the PCR values matched the baseline, and the server returned HTTP Status Code `200 OK` with a JSON payload containing the validation flag and a new session token. No false positives were observed during 10 consecutive clean-system attestations; however, the sample size is insufficient to claim a statistically meaningful false-positive rate:
 ```json
 {
   "valid": true,
