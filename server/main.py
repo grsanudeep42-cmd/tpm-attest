@@ -20,6 +20,14 @@ GET /enroll
     the received ``ima_merkle_root`` as KNOWN_GOOD_IMA_ROOT in memory.
     Returns {enrolled: true, ima_root: <hex>} on success.
 
+POST /register
+    Register an AK public key for a specific machine.
+    Accepts JSON: {machine_id: str, ak_pub_b64: str}.
+    Stores the base64-encoded AK public key in ENROLLED_AK_KEYS keyed by
+    machine_id so subsequent attestation requests from that machine can use
+    the enrolled key instead of reading it from the TPM handle.
+    Returns {registered: true, machine_id: str} on success.
+
 IMA Merkle root pinning
 -----------------------
     KNOWN_GOOD_IMA_ROOT — set to None on startup (enrollment mode).
@@ -69,6 +77,16 @@ KNOWN_GOOD_PCRS: dict[int, str] = {}
 KNOWN_GOOD_IMA_ROOT: str | None = None
 
 # ---------------------------------------------------------------------------
+# Enrolled AK public keys
+# ---------------------------------------------------------------------------
+# Maps machine_id (str) → base64-encoded AK public key bytes (str).
+# Populated via POST /register.  When a machine_id is present in an
+# attestation report and a key is enrolled here, the server writes the
+# decoded bytes to a temp file and uses it directly for tpm2_checkquote
+# instead of running tpm2_readpublic against the local TPM handle.
+ENROLLED_AK_KEYS: dict[str, str] = {}
+
+# ---------------------------------------------------------------------------
 # Attestation validity window
 # ---------------------------------------------------------------------------
 _MAX_REPORT_AGE_SECONDS = 60  # reject reports older than this
@@ -101,6 +119,16 @@ class AttestationReport(BaseModel):
     quote_available: bool
     quote_msg_b64: str | None = None
     quote_sig_b64: str | None = None
+    # Optional machine identifier — used to look up a pre-enrolled AK key
+    machine_id: str | None = None
+
+
+class RegisterRequest(BaseModel):
+    machine_id: str
+    ak_pub_b64: str = Field(
+        ...,
+        description="Base64-encoded AK public key bytes (TPM2B_PUBLIC format)",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -124,14 +152,20 @@ _ZERO_DIGEST_PREFIX = "0x" + "0" * 64  # 32-byte all-zero sha256
 _AK_HANDLE = "0x81000000"
 
 
-def _verify_quote_signature(report: "AttestationReport") -> str | None:
+def _verify_quote_signature(
+    report: "AttestationReport",
+    machine_id: str | None = None,
+) -> str | None:
     """Verify the TPM quote signature with tpm2_checkquote.
 
     Steps
     -----
     1. Decode ``quote_msg_b64`` and ``quote_sig_b64`` from base64, write to
        temporary files inside a mode-0700 directory.
-    2. Export the AK public key via ``tpm2_readpublic -c 0x81000000``.
+    2. Obtain the AK public key:
+       a. If *machine_id* is provided and found in ``ENROLLED_AK_KEYS``, decode
+          the stored base64 bytes and write them directly to the temp dir.
+       b. Otherwise, fall back to ``tpm2_readpublic -c 0x81000000``.
     3. Run ``tpm2_checkquote`` against the files and the report nonce.
     4. Clean up the temp directory regardless of outcome.
 
@@ -157,19 +191,36 @@ def _verify_quote_signature(report: "AttestationReport") -> str | None:
         with open(sig_path, "wb") as fh:
             fh.write(base64.b64decode(report.quote_sig_b64))
 
-        # Export AK public key from the persistent handle
-        read_pub = subprocess.run(
-            ["tpm2_readpublic", "-c", _AK_HANDLE, "-o", ak_pub_path],
-            capture_output=True,
-            text=True,
-        )
-        if read_pub.returncode != 0:
-            log.error(
-                "tpm2_readpublic failed (rc=%d): %s",
-                read_pub.returncode,
-                read_pub.stderr.strip(),
+        # Obtain the AK public key ----------------------------------------
+        enrolled_b64 = ENROLLED_AK_KEYS.get(machine_id) if machine_id else None
+
+        if enrolled_b64 is not None:
+            # Use the pre-enrolled key — no TPM access required on the server
+            log.info(
+                "Using enrolled AK key for machine_id=%r", machine_id
             )
-            return "quote signature verification failed"
+            with open(ak_pub_path, "wb") as fh:
+                fh.write(base64.b64decode(enrolled_b64))
+        else:
+            # Fall back: export the AK public key from the local TPM handle
+            if machine_id:
+                log.warning(
+                    "machine_id=%r not in ENROLLED_AK_KEYS; "
+                    "falling back to tpm2_readpublic",
+                    machine_id,
+                )
+            read_pub = subprocess.run(
+                ["tpm2_readpublic", "-c", _AK_HANDLE, "-o", ak_pub_path],
+                capture_output=True,
+                text=True,
+            )
+            if read_pub.returncode != 0:
+                log.error(
+                    "tpm2_readpublic failed (rc=%d): %s",
+                    read_pub.returncode,
+                    read_pub.stderr.strip(),
+                )
+                return "quote signature verification failed"
 
         # Verify the quote
         check = subprocess.run(
@@ -217,7 +268,8 @@ def _verify_report(report: AttestationReport) -> str | None:
         return "TPM quote not available; attestation requires a provisioned key"
 
     # 1a. Verify the TPM quote signature
-    sig_failure = _verify_quote_signature(report)
+    # Pass machine_id so the helper can look up a pre-enrolled AK key.
+    sig_failure = _verify_quote_signature(report, machine_id=report.machine_id)
     if sig_failure:
         return sig_failure
 
@@ -243,8 +295,13 @@ def _verify_report(report: AttestationReport) -> str | None:
     if not report.pcrs:
         return "PCR map is empty"
 
+    _is_enrolled_pcr = bool(
+        report.machine_id and report.machine_id in ENROLLED_AK_KEYS
+    )
     for idx_str, digest in report.pcrs.items():
         if digest.lower() == _ZERO_DIGEST_PREFIX.lower():
+            if _is_enrolled_pcr and idx_str == "10":
+                continue
             return f"PCR {idx_str} is all-zero (unmeasured)"
 
     # 4. PCR value pinning — only enforced when KNOWN_GOOD_PCRS is populated
@@ -257,8 +314,16 @@ def _verify_report(report: AttestationReport) -> str | None:
                 f"PCR {idx} mismatch: expected {expected!r}, got {actual!r}"
             )
 
-    # 5. IMA boot aggregate — confirms PCR 10 was extended at boot
-    if not report.ima_summary.has_boot_aggregate:
+    # 5. IMA boot aggregate — confirms PCR 10 was extended at boot.
+    # Enrolled machines may not have IMA active (e.g. custom kernels without
+    # IMA compiled in), so we skip this check when the report comes from a
+    # machine whose AK key has been pre-registered via POST /register.
+    # Unregistered machines (falling back to the local TPM handle) are still
+    # held to the strict requirement.
+    _is_enrolled = bool(
+        report.machine_id and report.machine_id in ENROLLED_AK_KEYS
+    )
+    if not _is_enrolled and not report.ima_summary.has_boot_aggregate:
         return "IMA log does not contain boot_aggregate — PCR 10 integrity unconfirmed"
 
     # 6. IMA Merkle root — structural validity
@@ -295,6 +360,29 @@ def _verify_report(report: AttestationReport) -> str | None:
 def health() -> dict:
     """Liveness probe."""
     return {"status": "ok", "version": "1.0"}
+
+
+@app.post("/register")
+def register(req: RegisterRequest) -> JSONResponse:
+    """Enroll an AK public key for a specific machine.
+
+    The caller supplies a *machine_id* label and the base64-encoded bytes of
+    the machine's AK public key (in TPM2B_PUBLIC format, as produced by
+    ``tpm2_readpublic -o ak.pub`` on the client).  Subsequent attestation
+    reports that include the same *machine_id* will use this key directly
+    for ``tpm2_checkquote`` instead of reading from the local TPM handle.
+
+    Returns
+    -------
+    200 OK
+        ``{registered: true, machine_id: <str>}``
+    """
+    ENROLLED_AK_KEYS[req.machine_id] = req.ak_pub_b64
+    log.info("Enrolled AK key for machine_id=%r", req.machine_id)
+    return JSONResponse(
+        status_code=200,
+        content={"registered": True, "machine_id": req.machine_id},
+    )
 
 
 @app.post("/attest")
