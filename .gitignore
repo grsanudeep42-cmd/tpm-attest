@@ -5,14 +5,23 @@ __pycache__/
 *.pyo
 *.pyd
 
-# Environment / secrets
-.env
-.env.*
+# Compiled binaries — build from source via phase3/Makefile
+phase3/eac_hook.so
+phase3/libeos_sdk.so
+phase3/fake_game
+phase3/mock_eac_client
+
+# Scraped / generated HTML docs
+phase3/eac_docs.html
 
 # TPM key material — NEVER commit these
 *.ctx
 *.pub
 *.priv
+
+# Environment / secrets
+.env
+.env.*
 
 # Temporary TPM quote artefacts
 /tmp/

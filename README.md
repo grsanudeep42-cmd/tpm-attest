@@ -35,9 +35,11 @@ The result: **Linux gamers are blocked from playing protected titles**, even on 
 
 1. **Reading PCR values** — Platform Configuration Registers extended by UEFI/GRUB/kernel during Measured Boot.
 2. **Reading the IMA log** — The kernel Integrity Measurement Architecture log of every binary executed at runtime.
-3. **Generating a TPM Quote** — A hardware-signed snapshot of PCR values, bound to a fresh nonce to prevent replay.
-4. **Bundling and submitting** an attestation report to a verification server.
-5. **Verifying** PCR values against a known-good baseline, checking IMA boot integrity, enforcing timestamp freshness, and issuing a short-lived **session token** on success.
+3. **Building an IMA Merkle tree** — A compact SHA-256 binary Merkle tree over all IMA entries, producing a single root hash that summarises the entire runtime measurement log.
+4. **Generating a TPM Quote** — A hardware-signed snapshot of PCR values, bound to a fresh nonce to prevent replay.
+5. **Bundling and submitting** an attestation report to a verification server.
+6. **Verifying** PCR values, quote signature (via `tpm2_checkquote`), IMA Merkle root integrity, and timestamp freshness — then issuing a short-lived **session token** on success.
+7. **Intercepting the EAC handshake** via an `LD_PRELOAD` hook that transparently gates game session start on a valid attestation token.
 
 ---
 
@@ -47,76 +49,56 @@ The result: **Linux gamers are blocked from playing protected titles**, even on 
 ┌─────────────────────────────────────────────────────────────┐
 │                     ATTESTED MACHINE                        │
 │                                                             │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
-│  │  pcr_reader  │    │  ima_reader  │    │   TPM 2.0    │  │
-│  │              │    │              │    │   Hardware   │  │
-│  │ tpm2_pcrread │    │ IMA ascii    │    │              │  │
-│  │ sha256:      │    │ runtime      │    │ tpm2_quote   │  │
-│  │ 0,1,4,7,9,10 │    │ measurements │    │ (signed PCRs)│  │
-│  └──────┬───────┘    └──────┬───────┘    └──────┬───────┘  │
-│         │                   │                   │           │
-│         └───────────────────┴───────────────────┘           │
-│                             │                               │
-│                    ┌────────▼────────┐                      │
-│                    │    report.py    │                      │
-│                    │                 │                      │
-│                    │  version        │                      │
-│                    │  timestamp      │                      │
-│                    │  nonce (fresh)  │                      │
-│                    │  pcrs           │                      │
-│                    │  ima_summary    │                      │
-│                    │  ima_log        │                      │
-│                    │  quote_msg_b64  │                      │
-│                    │  quote_sig_b64  │                      │
-│                    └────────┬────────┘                      │
+│  ┌──────────────┐    ┌──────────────────────┐  ┌─────────┐  │
+│  │  pcr_reader  │    │      ima_reader       │  │ TPM 2.0 │  │
+│  │ tpm2_pcrread │    │  IMA log → Merkle    │  │Hardware │  │
+│  │ sha256:      │    │  tree (root+depth+   │  │tpm2_quote│ │
+│  │ 0,1,4,7,9,10 │    │  leaf_count)         │  │         │  │
+│  └──────┬───────┘    └──────────┬───────────┘  └────┬────┘  │
+│         └──────────────────────┴──────────────────┘         │
+│                                │                             │
+│                       ┌────────▼────────┐                    │
+│                       │    report.py    │                    │
+│                       │  nonce (fresh)  │                    │
+│                       │  pcrs           │                    │
+│                       │  ima_summary    │                    │
+│                       │  ima_merkle_root│                    │
+│                       │  quote_msg_b64  │                    │
+│                       │  quote_sig_b64  │                    │
+│                       └────────┬────────┘                    │
+│                                │                             │
+│  ┌─────────────────────────────┴──────────────┐              │
+│  │  phase3/shim.py  (Unix socket daemon)      │              │
+│  │  Bridges eac_hook.so ↔ attestation server  │              │
+│  └─────────────────────────────┬──────────────┘              │
+│                                │                             │
+│  ┌─────────────────────────────┴──────────────┐              │
+│  │  phase3/eac_hook.so  (LD_PRELOAD)          │              │
+│  │  Intercepts EOS_AntiCheatClient_* symbols  │              │
+│  │  Blocks game until valid token received    │              │
+│  └────────────────────────────────────────────┘              │
 └─────────────────────────────│───────────────────────────────┘
                               │  HTTP POST /attest
-                              │  (JSON attestation report)
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                   VERIFICATION SERVER                       │
 │                    (server/main.py)                         │
 │                                                             │
 │   ① TPM quote present?                                      │
-│   ② Report timestamp within 60s window? (replay protection) │
-│   ③ PCR values non-zero? (system was measured)              │
-│   ④ PCR values match known-good baseline? (if configured)   │
-│   ⑤ IMA log contains boot_aggregate? (PCR 10 extended)      │
+│   ② Quote signature valid? (tpm2_checkquote)                │
+│   ③ Report timestamp within 60s? (replay protection)        │
+│   ④ PCR values non-zero?                                    │
+│   ⑤ PCR values match known-good baseline? (if configured)   │
+│   ⑥ IMA log contains boot_aggregate?                        │
+│   ⑦ IMA Merkle root valid? (matches pinned baseline)        │
 │                                                             │
-│              ┌─────────────────────────┐                    │
-│   PASS  ───► │  {                      │                    │
-│              │    "valid": true,       │                    │
-│              │    "token": "<uuid4>",  │                    │
-│              │    "expires_at": "..."  │  Session Token     │
-│              │  }                      │◄─────────────────  │
-│              └─────────────────────────┘                    │
+│   POST /register — enroll an AK public key by machine_id    │
+│   POST /enroll   — pin current IMA Merkle root as baseline  │
 │                                                             │
-│              ┌─────────────────────────┐                    │
-│   FAIL  ───► │  {                      │                    │
-│              │    "valid": false,      │                    │
-│              │    "reason": "..."      │                    │
-│              │  }                      │                    │
-│              └─────────────────────────┘                    │
+│   PASS ──► { "valid": true, "token": "<uuid4>",             │
+│              "expires_at": "<ISO UTC>" }                     │
+│   FAIL ──► { "valid": false, "reason": "..." }              │
 └─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼  (Phase 3 — in progress)
-              ┌───────────────────────────────┐
-              │    EAC Handshake Shim         │
-              │  (translates session token    │
-              │   into EAC-compatible proof)  │
-              └───────────────────────────────┘
-```
-
-### Data Flow Summary
-
-```
-Measured Boot → UEFI/GRUB/Kernel extends PCR 0,1,4,7
-IMA subsystem → extends PCR 10 for every measured binary
-tpm2_pcrread  → snapshot of sha256 PCR bank
-tpm2_quote    → hardware-signed PCR snapshot + nonce
-report.py     → bundles everything into JSON
-POST /attest  → server verifies chain of trust
-session token → (future) accepted by game server as proof of integrity
 ```
 
 ---
@@ -125,7 +107,7 @@ session token → (future) accepted by game server as proof of integrity
 
 ### `agent/pcr_reader.py`
 
-Shells out to `tpm2_pcrread` to read the **sha256 PCR bank** for the following policy-relevant registers:
+Reads the **sha256 PCR bank** via `tpm2_pcrread` for policy-relevant registers:
 
 | PCR | Measured Content |
 |-----|-----------------|
@@ -136,35 +118,22 @@ Shells out to `tpm2_pcrread` to read the **sha256 PCR bank** for the following p
 | **9** | Kernel and initramfs |
 | **10** | IMA runtime measurements (extended continuously) |
 
-Returns `dict[int, str]` — PCR index → `0x<sha256 hex>`.
-
----
-
 ### `agent/ima_reader.py`
 
-Reads `/sys/kernel/security/ima/ascii_runtime_measurements` (via `sudo cat`) and parses each line of the IMA log template format:
+Reads `/sys/kernel/security/ima/ascii_runtime_measurements` and provides:
 
-```
-<pcr>  <template_hash>  <template_name>  <file_hash>  <filename>
-  10   3bee321a...      ima-ng           sha256:86a4…  /usr/bin/bash
-```
+- **`read_ima_log()`** — full parsed log as `list[dict]`
+- **`read_ima_summary()`** — aggregated metrics: `{total_entries, unique_files, has_boot_aggregate, modules_measured}`
+- **`build_ima_merkle_tree(entries)`** — builds a SHA-256 binary Merkle tree over all IMA entries; returns `{root, depth, leaf_count, leaves}`
+- **`get_ima_proof(entries, index)`** — returns the Merkle inclusion proof for any single entry
 
-Provides two public functions:
-
-- **`read_ima_log()`** — returns full parsed log as `list[dict]`
-- **`read_ima_summary()`** — aggregates into `{total_entries, unique_files, has_boot_aggregate, modules_measured}`
-
-The `boot_aggregate` entry is the anchor of the IMA chain — it proves the IMA log is rooted in the TPM state at boot time.
-
----
+The `boot_aggregate` entry anchors the IMA log to TPM state at boot. The Merkle root compresses thousands of entries into a single 64-char hex string that the server can pin and compare.
 
 ### `agent/report.py`
 
-Bundles PCR values, IMA data, and a TPM quote into a single signed attestation report.
+Bundles PCR values, IMA Merkle tree metadata, IMA summary, and a TPM quote into one signed attestation report.
 
-A fresh **32-byte random nonce** (`secrets.token_hex(32)`) is generated per report to prevent replay attacks.
-
-The TPM quote is obtained via `tpm2_quote` using a persistent key at handle `0x81000000`. If the key is not provisioned, `quote_available` degrades gracefully to `false`.
+A fresh **32-byte random nonce** is generated per report to prevent replay attacks. The nonce is passed as `tpm2_quote` qualifying data, binding the quote to this specific report.
 
 **Report schema:**
 
@@ -173,18 +142,19 @@ The TPM quote is obtained via `tpm2_quote` using a persistent key at handle `0x8
 | `version` | `"1.0"` | Schema version |
 | `timestamp` | ISO 8601 UTC | Report generation time |
 | `nonce` | 64-char hex | Fresh random — binds quote to this report |
-| `pcrs` | `dict[int, str]` | PCR index → sha256 hex digest |
-| `ima_summary` | object | Aggregated IMA metrics |
-| `ima_log` | `list[dict]` | Full IMA log entries |
+| `pcrs` | `dict[str, str]` | PCR index → sha256 hex digest |
+| `ima_summary` | object | `{total_entries, unique_files, has_boot_aggregate, modules_measured}` |
+| `ima_merkle_root` | 64-char hex | SHA-256 Merkle root over all IMA entries |
+| `ima_merkle_depth` | int | Tree depth |
+| `ima_leaf_count` | int | Number of IMA entries |
 | `quote_available` | bool | Whether TPM quote was obtained |
-| `quote_msg_b64` | base64 \| null | Raw TPM quote message |
-| `quote_sig_b64` | base64 \| null | TPM quote signature |
-
----
+| `quote_msg_b64` | base64 \| null | Raw TPM quote message (`TPMS_ATTEST`) |
+| `quote_sig_b64` | base64 \| null | TPM quote signature (`TPMT_SIGNATURE`) |
+| `machine_id` | str \| null | Optional — used to look up a pre-enrolled AK key |
 
 ### `server/main.py`
 
-A **FastAPI** verification server exposing:
+A **FastAPI** verification server exposing four endpoints:
 
 #### `GET /health`
 ```json
@@ -193,32 +163,55 @@ A **FastAPI** verification server exposing:
 
 #### `POST /attest`
 
-Accepts an attestation report (JSON). Runs 5 verification checks in order:
+Runs **7 verification checks** in order:
 
 1. **Quote presence** — report must include a TPM-signed quote
-2. **Timestamp freshness** — report must be within 60 seconds of server time (replay protection)
-3. **PCR non-zero** — all PCR values must be non-zero (system was measured at boot)
-4. **PCR value pinning** — if `KNOWN_GOOD_PCRS` is configured, values must match exactly
-5. **IMA boot aggregate** — IMA log must contain `boot_aggregate` (confirms PCR 10 integrity)
+2. **Quote signature** — `tpm2_checkquote` verifies the `TPMT_SIGNATURE` against the AK public key
+3. **Timestamp freshness** — report must be within 60 seconds (replay protection)
+4. **PCR non-zero** — all PCR values must be non-zero
+5. **PCR value pinning** — if `KNOWN_GOOD_PCRS` is configured, values must match exactly
+6. **IMA boot aggregate** — IMA log must contain `boot_aggregate`
+7. **IMA Merkle root** — structural validity check; if `KNOWN_GOOD_IMA_ROOT` is pinned, root must match
 
-**Success response (200):**
+**Success (200):**
 ```json
-{
-  "valid": true,
-  "token": "550e8400-e29b-41d4-a716-446655440000",
-  "expires_at": "2026-06-22T11:15:00+00:00"
-}
+{"valid": true, "token": "<uuid4>", "expires_at": "<ISO UTC>"}
+```
+**Failure (400):**
+```json
+{"valid": false, "reason": "PCR 7 mismatch: expected '0xABCD...', got '0x1234...'"}
 ```
 
-**Failure response (400):**
+Tokens are valid for **5 minutes**.
+
+#### `POST /register`
+
+Enroll an AK public key for a specific machine (for cross-machine attestation):
+
 ```json
-{
-  "valid": false,
-  "reason": "PCR 7 mismatch: expected '0xABCD...', got '0x1234...'"
-}
+{"machine_id": "my-gaming-rig", "ak_pub_b64": "<base64 TPM2B_PUBLIC>"}
+```
+```json
+{"registered": true, "machine_id": "my-gaming-rig"}
 ```
 
-Tokens are valid for **5 minutes** and are UUID4-format strings.
+When a machine submits an attestation report with a matching `machine_id`, the server uses the enrolled key for `tpm2_checkquote` instead of reading from its own TPM handle.
+
+#### `POST /enroll`
+
+Pin the IMA Merkle root of a verified clean system as the baseline. Runs full attestation verification first, then stores the `ima_merkle_root` as `KNOWN_GOOD_IMA_ROOT`. Future reports must match this root.
+
+```json
+{"enrolled": true, "ima_root": "<64-char hex>"}
+```
+
+### `phase3/eac_hook.c` + `phase3/shim.py`
+
+The **Phase 3 EAC intercept layer**:
+
+- **`eac_hook.so`** — An `LD_PRELOAD` shared library that intercepts `EOS_AntiCheatClient_AddNotifyMessageToServer` (the EAC SDK entry point). Before resolving the real symbol, it connects to a Unix socket (`/tmp/eac_shim.sock`), sends a handshake, and waits for an attestation result. If `{"valid": true}` is returned, it resolves the real EAC symbol and allows the game to proceed.
+- **`shim.py`** — A Unix socket daemon that bridges the game hook to the attestation server. Accepts connections from `eac_hook.so`, calls `generate_report()`, POSTs to `/attest`, and returns the result.
+- **`fake_game.c`** — A mock game binary that calls the EAC SDK entry point, used to demonstrate the full intercept flow without a real game.
 
 ---
 
@@ -228,12 +221,21 @@ Tokens are valid for **5 minutes** and are UUID4-format strings.
 tpm-attest/
 ├── agent/
 │   ├── __init__.py
-│   ├── pcr_reader.py     # Reads TPM2 PCR values via tpm2_pcrread subprocess
-│   ├── ima_reader.py     # Parses /sys/kernel/security/ima/ascii_runtime_measurements
-│   └── report.py         # Bundles PCRs + IMA + TPM quote → signed attestation report
+│   ├── pcr_reader.py     # Reads TPM2 PCR values via tpm2_pcrread
+│   ├── ima_reader.py     # Parses IMA log; builds SHA-256 Merkle tree
+│   └── report.py         # Bundles PCRs + IMA Merkle + TPM quote → report
+├── phase3/
+│   ├── eac_hook.c        # LD_PRELOAD hook — intercepts EAC SDK entry point
+│   ├── eos_stub.c        # Mock EOS SDK stub for local testing
+│   ├── fake_game.c       # Mock game binary that calls EAC SDK
+│   ├── mock_eac_client.c # Standalone test client for the shim socket
+│   ├── shim.py           # Unix socket daemon: game ↔ attestation server
+│   └── Makefile          # Builds eac_hook.so, libeos_sdk.so, fake_game
+├── paper/
+│   └── research_paper.md # Full research paper draft
 ├── server/
 │   ├── __init__.py
-│   └── main.py           # FastAPI verification server (POST /attest, GET /health)
+│   └── main.py           # FastAPI server (POST /attest /register /enroll, GET /health)
 ├── requirements.txt
 └── README.md
 ```
@@ -245,10 +247,11 @@ tpm-attest/
 | Requirement | Notes |
 |---|---|
 | **Linux** with TPM 2.0 | Physical TPM or emulator (`swtpm`) |
-| **`tpm2-tools`** | `tpm2_pcrread`, `tpm2_quote`, `tpm2_createprimary`, `tpm2_evictcontrol` |
+| **`tpm2-tools`** | `tpm2_pcrread`, `tpm2_quote`, `tpm2_checkquote`, `tpm2_createprimary`, `tpm2_evictcontrol`, `tpm2_readpublic` |
 | **Python 3.11+** | |
 | **IMA enabled in kernel** | `CONFIG_IMA=y`, mounted securityfs |
 | **`sudo` access** | Required by `ima_reader` to read the IMA log |
+| **gcc + make** | Only needed to rebuild `phase3/` binaries from source |
 
 ### Install tpm2-tools
 
@@ -266,10 +269,7 @@ sudo pacman -S tpm2-tools
 ### Verify TPM access
 
 ```bash
-# Check that /dev/tpm0 or /dev/tpmrm0 is present
 ls -la /dev/tpm*
-
-# Confirm tpm2-tools can talk to the TPM
 tpm2_getcap properties-fixed
 ```
 
@@ -280,7 +280,7 @@ tpm2_getcap properties-fixed
 ### 1. Clone and create the virtual environment
 
 ```bash
-git clone https://github.com/yourname/tpm-attest.git
+git clone https://github.com/grsanudeep42-cmd/tpm-attest.git
 cd tpm-attest
 
 python3 -m venv .venv
@@ -292,20 +292,13 @@ pip install -r requirements.txt
 ### 2. TPM group permissions (recommended over running as root)
 
 ```bash
-# Add yourself to the tss group (manages /dev/tpmrm0)
 sudo usermod -aG tss $USER
-
-# Apply without logging out
 newgrp tss
-
-# Verify
 ls -la /dev/tpmrm0
-# crw-rw---- 1 root tss 10, 224 Jun 22 10:00 /dev/tpmrm0
+# crw-rw---- 1 root tss 10, 224 ...
 ```
 
 ### 3. Provision a persistent attestation key
-
-This creates an RSA-2048 primary key in the TPM Owner hierarchy and persists it at handle `0x81000000`:
 
 ```bash
 # Create a primary key in the owner hierarchy
@@ -314,79 +307,125 @@ tpm2_createprimary -C o -g sha256 -G rsa -c primary.ctx
 # Persist the key at a fixed handle
 tpm2_evictcontrol -C o -c primary.ctx 0x81000000
 
-# Verify the key is persistent
+# Verify
 tpm2_getcap handles-persistent
 # - 0x81000000
 ```
 
-> **Note:** The persistent handle `0x81000000` is hardcoded in `agent/report.py`. If you use a different handle, update `_TPM_KEY_HANDLE`.
+> **Note:** The persistent handle `0x81000000` is hardcoded in `agent/report.py`. Update `_TPM_KEY_HANDLE` if you use a different handle.
 
 ### 4. Enable IMA (if not already active)
 
-Check if IMA is running:
 ```bash
 sudo cat /sys/kernel/security/ima/ascii_runtime_measurements | head -3
 ```
 
-If the file is missing, add to your kernel command line (e.g., in `/etc/default/grub`):
+If the file is missing, add to your kernel command line in `/etc/default/grub`:
 ```
 GRUB_CMDLINE_LINUX="... ima_policy=tcb"
 ```
 Then run `sudo update-grub` and reboot.
 
-### 5. Configure the PCR baseline (optional but recommended)
+### 5. Configure baselines (optional but recommended)
 
-Edit `server/main.py` and populate `KNOWN_GOOD_PCRS` with the expected values from your trusted system:
-
-```python
-# Capture current values on a known-clean system
+**PCR pinning** — capture current values on a known-clean system:
+```bash
 python -m agent.pcr_reader
 ```
+Paste into `server/main.py` → `KNOWN_GOOD_PCRS`.
 
-```python
-# Paste into server/main.py
-KNOWN_GOOD_PCRS: dict[int, str] = {
-    0: "0x3D458931A3680CA3E31DBF38DBABCD0A...",
-    7: "0xB6E5E5A3C1A8D2F7...",
-    # ...
-}
+**IMA Merkle root pinning** — enroll via the server after starting it:
+```bash
+# Generate a report and POST it to /enroll
+python -m agent.report | curl -s -X POST http://localhost:8080/enroll \
+  -H "Content-Type: application/json" -d @-
+# {"enrolled": true, "ima_root": "<64-char hex>"}
 ```
 
 ---
 
 ## Running
 
-### Attestation Agent
+### Option A — Full pipeline (Phases 1+2+3)
 
+**Terminal 1 — Verification server:**
 ```bash
-# Activate the virtual environment
 source .venv/bin/activate
-
-# Generate and display an attestation report (IMA log omitted from stdout)
-python -m agent.report
-
-# Run individual components for debugging:
-python -m agent.pcr_reader   # PCR values only
-python -m agent.ima_reader   # IMA summary only
+uvicorn server.main:app --host 0.0.0.0 --port 8080
 ```
 
-### Verification Server
+**Terminal 2 — EAC shim:**
+```bash
+source .venv/bin/activate
+python3 phase3/shim.py
+# [shim] INFO EAC shim listening on /tmp/eac_shim.sock
+```
+
+**Terminal 3 — Mock game (triggers full intercept):**
+```bash
+cd phase3
+LD_PRELOAD=./eac_hook.so ./fake_game
+# [hook] EOS_AntiCheatClient_AddNotifyMessageToServer intercepted
+# [hook] Attestation result: valid=1
+# [game] EAC registered — gameplay running
+```
+
+### Option B — Agent + server only (Phases 1+2)
 
 ```bash
 source .venv/bin/activate
 
-# Start the server
-uvicorn server.main:app --host 0.0.0.0 --port 8080
+# Generate a report and submit it
+python -m agent.report | curl -s -X POST http://localhost:8080/attest \
+  -H "Content-Type: application/json" -d @-
 
-# Or using the module entry point
-python -m server.main
+# Or run components individually
+python -m agent.pcr_reader    # PCR values only
+python -m agent.ima_reader    # IMA summary + Merkle root
+```
+
+### Build phase3 binaries from source
+
+```bash
+cd phase3
+make clean && make
+# Produces: eac_hook.so  libeos_sdk.so  fake_game  mock_eac_client
+```
+
+---
+
+## Cross-Machine Attestation
+
+`tpm-attest` supports **remote attestation across machines** — the attestation agent and verification server do not need to share a TPM.
+
+### Setup
+
+**On the client machine** — export the AK public key:
+```bash
+tpm2_readpublic -c 0x81000000 -o ak.pub
+AK_B64=$(base64 -w0 ak.pub)
+```
+
+**Register with the server:**
+```bash
+curl -s -X POST http://<server>:8080/register \
+  -H "Content-Type: application/json" \
+  -d "{\"machine_id\": \"my-gaming-rig\", \"ak_pub_b64\": \"$AK_B64\"}"
+# {"registered": true, "machine_id": "my-gaming-rig"}
+```
+
+**Submit attestation reports** from the client with `machine_id` set:
+```python
+report = generate_report()
+report["machine_id"] = "my-gaming-rig"
+# POST to /attest — server uses enrolled key, no TPM access needed server-side
 ```
 
 ---
 
 ## Example Output
 
-### Agent — PCR values (`python -m agent.pcr_reader`)
+### PCR values (`python -m agent.pcr_reader`)
 
 ```json
 {
@@ -399,87 +438,28 @@ python -m server.main
 }
 ```
 
-### Agent — IMA summary (`python -m agent.ima_reader`)
+### IMA summary + Merkle tree (`python -m agent.ima_reader`)
 
 ```json
 {
-  "total_entries": 4821,
-  "unique_files": 1203,
-  "has_boot_aggregate": true,
-  "modules_measured": 87
-}
-```
-
-### Agent — Full attestation report (`python -m agent.report`)
-
-```json
-{
-  "version": "1.0",
-  "timestamp": "2026-06-22T10:47:33.214519+00:00",
-  "nonce": "a3f8e2b1c94d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2",
-  "pcrs": {
-    "0": "0x3D458931A3680CA3E31DBF38DBABCD0AC27BDC95B4F5A833C33302E0C37FD5E",
-    "1": "0xB16D2E0E86E23C1A5B2E3F7F00102A3E4A6D178C9A1D5E7F9B0C3D8A2F6E4C1",
-    "4": "0xA7C4B3E2F1D09A8B7C6D5E4F3A2B1C0D9E8F7A6B5C4D3E2F1A0B9C8D7E6F5A4",
-    "7": "0xB2F1E0D9C8B7A695847362514031201F0E0D0C0B0A090807060504030201001F",
-    "9": "0xC3D4E5F6A7B8C9D0E1F2A3B4C5D6E7F8A9B0C1D2E3F4A5B6C7D8E9F0A1B2C3",
-    "10": "0xD4E5F6A7B8C9D0E1F2A3B4C5D6E7F8A9B0C1D2E3F4A5B6C7D8E9F0A1B2C3D4"
-  },
   "ima_summary": {
     "total_entries": 4821,
     "unique_files": 1203,
     "has_boot_aggregate": true,
     "modules_measured": 87
   },
-  "quote_available": true,
-  "quote_msg_b64": "ARoAAQALAAQAA...(base64-encoded TPM quote structure)...",
-  "quote_sig_b64": "ABQACwAg...(base64-encoded TPMT_SIGNATURE)..."
+  "merkle_root": "a3f8e2b1c94d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2",
+  "merkle_depth": 13,
+  "merkle_leaf_count": 4821
 }
 ```
 
-### Server — Successful attestation (`POST /attest`)
+### Successful attestation (`POST /attest`)
 
 ```
 HTTP 200 OK
-
-{
-  "valid": true,
-  "token": "550e8400-e29b-41d4-a716-446655440000",
-  "expires_at": "2026-06-22T10:52:33.214519+00:00"
-}
+{"valid": true, "token": "550e8400-e29b-41d4-a716-446655440000", "expires_at": "2026-06-22T10:52:33+00:00"}
 ```
-
----
-
-## Research Context
-
-This project is grounded in the following standards and specifications:
-
-### TPM 2.0 — Trusted Platform Module
-
-- [**TCG TPM 2.0 Specification**](https://trustedcomputinggroup.org/resource/tpm-library-specification/) — Part 1 (Architecture), Part 3 (Commands)
-- **PCRs (Platform Configuration Registers)** — 24 hardware registers extended by `H_new = SHA256(H_old ‖ data)`. Values are monotonically chained; resetting requires a reboot.
-- **TPM Quote** — A `TPMS_ATTEST` structure signed by a resident key. Proves current PCR state is bound to a specific nonce. Defined in TPM2B_ATTEST / TPM2_Quote (command code 0x0158).
-- **Persistent keys** — Keys created with `tpm2_createprimary` and evicted to NV storage via `tpm2_evictcontrol`. Survive reboots; cannot be extracted without the TPM.
-
-### IMA — Integrity Measurement Architecture
-
-- [**Linux IMA documentation**](https://www.kernel.org/doc/html/latest/security/IMA-templates.html)
-- IMA extends **PCR 10** every time a new file is executed or mapped. The log is append-only from kernel perspective.
-- The `boot_aggregate` entry is computed as `SHA256(PCR_0 ‖ PCR_1 ‖ … ‖ PCR_7)` at IMA init time, anchoring the runtime log to Measured Boot.
-- Template formats: `ima` (SHA1 only), `ima-ng` (algorithm:hash), `ima-sig` (includes file signature).
-
-### Remote Attestation
-
-- [**IETF RATS Architecture (RFC 9334)**](https://www.rfc-editor.org/rfc/rfc9334) — defines Attester, Verifier, and Relying Party roles
-- [**TCG Platform Attestation**](https://trustedcomputinggroup.org/resource/platform-certificate-profile/) — reference for device attestation certificates
-- This project implements the **background-check model**: the agent (Attester) sends evidence directly to the verification server (Verifier+Relying Party combined).
-
-### Measured Boot
-
-- UEFI Secure Boot extends PCR 7 with the Secure Boot state and signing authority.
-- GRUB2 with TPM support extends PCR 8/9 for kernel and initrd.
-- Systemd-boot extends PCR 4 with the EFI application hash.
 
 ---
 
@@ -489,28 +469,32 @@ This project is grounded in the following standards and specifications:
 
 - [x] `pcr_reader.py` — reads sha256 PCR bank via `tpm2_pcrread`
 - [x] `ima_reader.py` — parses IMA ascii log, computes summary metrics
-- [x] `report.py` — bundles PCRs, IMA data, TPM quote into a signed report with replay-resistant nonce
+- [x] `report.py` — bundles PCRs, IMA data, TPM quote with replay-resistant nonce
 
 ### ✅ Phase 2 — Verification Server (Complete)
 
-- [x] `server/main.py` — FastAPI server with `POST /attest` and `GET /health`
-- [x] 5-check verification pipeline (quote, freshness, non-zero PCRs, baseline pinning, IMA boot aggregate)
+- [x] `server/main.py` — FastAPI server with 4 endpoints
+- [x] 7-check verification pipeline including full `tpm2_checkquote` signature verification
+- [x] IMA Merkle tree — compact integrity proof replacing full log transmission
+- [x] `POST /register` — cross-machine AK key enrollment
+- [x] `POST /enroll` — IMA Merkle root baseline pinning
 - [x] Short-lived session token issuance (UUID4, 5-minute lifetime)
 
-### 🔄 Phase 3 — EAC Handshake Shim (In Progress)
+### ✅ Phase 3 — EAC Handshake Shim (Complete)
 
-- [ ] Intercept EAC handshake at the Wine/Proton layer
-- [ ] Translate TPM session token into EAC-compatible attestation proof
-- [ ] Expose a local IPC socket for Proton to query attestation state
-- [ ] Integration tests against EAC sandbox endpoint
+- [x] `eac_hook.so` — LD_PRELOAD hook intercepting EOS SDK anti-cheat entry point
+- [x] `shim.py` — Unix socket daemon bridging game hook to attestation server
+- [x] `fake_game` + `libeos_sdk.so` — mock environment for end-to-end testing
+- [x] Full pipeline verified: hook → shim → agent → server → token → game proceeds
 
 ### 🗓 Phase 4 — Hardening & Distribution
 
-- [ ] Quote signature verification (currently checks presence only — needs full `TPMT_SIGNATURE` verification via `tpm2_checkquote`)
 - [ ] EK certificate chain validation against manufacturer CA
+- [ ] Proper nonce embedding verification in quote qualifying data
 - [ ] Persistent token storage with revocation
 - [ ] Packaging: systemd service unit for the agent, Docker image for the server
-- [ ] Support for `swtpm` in CI for integration testing without physical TPM hardware
+- [ ] `swtpm` integration in CI for testing without physical TPM hardware
+- [ ] Proton/Wine integration (replace mock EAC SDK with real handshake protocol)
 
 ---
 
@@ -518,10 +502,32 @@ This project is grounded in the following standards and specifications:
 
 > **This is a research / proof-of-concept project.** Do not use in production without completing Phase 4 hardening.
 
-- **Quote signature is not yet fully verified** — the server currently checks that `quote_available: true` but does not cryptographically verify the `TPMT_SIGNATURE` against the EK public key. This is the most critical gap for Phase 4.
+- **Quote signature is fully verified** via `tpm2_checkquote` against the enrolled or local AK public key. The critical Phase 3 gap is closed.
 - **KNOWN_GOOD_PCRS is empty by default** — PCR pinning is skipped unless you populate this dict. Without it, any machine with a TPM and IMA enabled will pass.
-- **The IMA log is trusted as-read** — a kernel-level attacker who can modify the IMA log subsystem could forge entries. The TPM quote partially mitigates this (PCR 10 reflects IMA state), but full mitigation requires verifying the quote signature chain.
-- **Nonce freshness** is enforced by a 60-second timestamp window, not by verifying the nonce is embedded in the quote's qualifying data. Phase 4 will add proper qualifying data validation.
+- **KNOWN_GOOD_IMA_ROOT starts as None** — the server logs received roots (enrollment mode) until you call `POST /enroll` on a verified clean system.
+- **Nonce freshness** is enforced by a 60-second timestamp window. Phase 4 will add proper qualifying data validation to verify the nonce is embedded in the quote structure itself.
+- **AK keys are in-memory only** — `ENROLLED_AK_KEYS` is reset on server restart. Phase 4 will add persistent storage.
+
+---
+
+## Research Context
+
+### TPM 2.0 — Trusted Platform Module
+
+- [**TCG TPM 2.0 Specification**](https://trustedcomputinggroup.org/resource/tpm-library-specification/) — Part 1 (Architecture), Part 3 (Commands)
+- **PCRs** — 24 hardware registers extended by `H_new = SHA256(H_old ‖ data)`. Values are monotonically chained; resetting requires a reboot.
+- **TPM Quote** — A `TPMS_ATTEST` structure signed by a resident key. Proves current PCR state is bound to a specific nonce. Command code `0x0158`.
+
+### IMA — Integrity Measurement Architecture
+
+- [**Linux IMA documentation**](https://www.kernel.org/doc/html/latest/security/IMA-templates.html)
+- IMA extends **PCR 10** every time a new file is executed or mapped.
+- The `boot_aggregate` entry is `SHA256(PCR_0 ‖ … ‖ PCR_7)` at IMA init, anchoring the runtime log to Measured Boot.
+
+### Remote Attestation
+
+- [**IETF RATS Architecture (RFC 9334)**](https://www.rfc-editor.org/rfc/rfc9334) — defines Attester, Verifier, and Relying Party roles
+- This project implements the **background-check model**: the agent sends evidence directly to the combined Verifier+Relying Party.
 
 ---
 
