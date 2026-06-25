@@ -1,6 +1,6 @@
 # TPM-Attest: Hardware-Rooted Integrity Attestation as a Kernel-Level Anti-Cheat Alternative for Linux
 
-**Author:** Anudeep Gedela (GITAM University, Visakhapatnam)
+**Author:** Anudeep Gedela (Independent Researcher)
 
 ---
 
