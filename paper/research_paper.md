@@ -74,6 +74,8 @@ TPM-Attest successfully mitigates the following attack vectors:
 ### Out-of-Scope Attacks and Trust Assumptions
 We assume that the physical TPM chip is secure, genuine, and un-tampered with. Attacks that involve hardware-level bus sniffing (e.g., tapping the LPC or SPI bus to read TPM traffic) are theoretically possible but require physical access and specialized hardware, which is beyond the scope of software cheating. We also assume that firmware components (UEFI, Bootloader) are uncompromised; BIOS-level compromises that execute before the TPM initializes are outside our threat model, though Secure Boot policies measured in PCR 7 partially protect against this.
 
+**Hardware-Based Cheating (DMA Cards):** Direct Memory Access (DMA) hardware devices (e.g., PCIe-leech cards, external microcontrollers reading physical RAM) bypass the operating system's software execution layer entirely. Because DMA cheats read game state directly from physical memory blocks without executing unauthorized code on the host CPU or modifying kernel structures, software-based remote attestation and IMA measurements cannot detect them. Hardware cheat detection is explicitly out of scope for TPM-Attest, requiring hardware-level memory encryption mechanisms (e.g., IOMMU restriction, AMD SEV, or Intel TDX).
+
 ### Comparison Table
 The table below contrasts the security properties of a kernel driver approach versus the TPM-Attest remote attestation approach across six fundamental categories:
 
@@ -309,9 +311,27 @@ An adversary with full root access could compile a custom Linux kernel that simp
 ### 4. Automated Baseline and Whitelist Database
 Currently, baseline measurements are enrolled manually. A production deployment requires a distributed Public Key Infrastructure (PKI). The server must verify that the client's Attestation Key (AK) is backed by a genuine Endorsement Key (EK) certified by the TPM manufacturer's CA. Additionally, the server should automatically sync with official operating system distribution channels (such as Valve's SteamOS update servers) to dynamically whitelist official kernel hashes and PCR baselines, eliminating manual enrollment overhead.
 
+### 5. Machine Owner Key (MOK) Chain Handling
+A major limitation of a strict IMA whitelist policy is the handling of custom or patched out-of-tree kernel modules (e.g., DKMS, custom hardware drivers, OpenRazer). Because users compile these modules locally, their cryptographic hashes vary dynamically. In a strict attestation model, this results in immediate rejection. To solve this, a production implementation must support local Machine Owner Key (MOK) signature verification. The verifier can validate that the custom module is signed by a valid public certificate matching the user's MOK. The integrity of the local MOK registry is itself measured into PCR 7 during boot. This delegates trust of compiled modules to the machine's owner while cryptographically ensuring the MOK configuration itself has not been tampered with.
+
 ---
 
-## 9. Conclusion
+## 9. Ethical Considerations and Escalation Risks
+
+While remote attestation offers a privacy-preserving alternative to kernel-level drivers, it introduces complex ethical trade-offs and escalation risks:
+
+### Platform Lock-in and User Agency
+Enforcing strict hardware-rooted platform integrity can easily escalate into a mechanism for user lock-in. If game publishers enforce policies that reject any modified kernel, custom MOK, or non-standard Linux distribution, they effectively strip the user of their sovereignty over their own hardware. This creates a "TiVoization" dilemma, where the hardware owner is locked out of running customized software on their device if they wish to access commercial services. 
+
+### Shim Vulnerability and Escalation of Privilege
+The client-side dynamic hook (`LD_PRELOAD`) and local IPC socket daemon introduce new local attack vectors. If an attacker exploits the user-space communication channel or compromises the local IPC socket permissions, they might achieve local privilege escalation or bypass attestation entirely by injecting fake reports into the daemon. Securing this boundary requires strict socket access control lists (ACLs) and sandboxing the client agent.
+
+### The Security Arms Race
+Shifting the security perimeter to hardware-rooted attestation does not stop cheating; it merely forces cheats to escalate. This transition is highly likely to drive cheating technology towards hardware-level compromises (such as physical bus tapping, BIOS/UEFI firmware implants, or custom PCIe DMA devices). Consequently, the security boundary is pushed into firmware validation, necessitating complex SPI flash auditing tools and firmware-level measurements.
+
+---
+
+## 10. Conclusion
 
 This paper presented TPM-Attest, an open-source framework demonstrating that hardware-rooted remote attestation using TPM 2.0 and Linux IMA is a viable, high-security alternative to proprietary, invasive kernel-level anti-cheat drivers. By moving from a model of active runtime memory scanning to passive cryptographic boot and execution verification, we establish a robust chain of trust that protects game integrity while preserving system stability and user privacy. 
 
@@ -319,7 +339,7 @@ Our working proof-of-concept successfully intercepts game anti-cheat calls, gath
 
 ---
 
-## References
+## 11. References
 
 1. **Trusted Computing Group.** (2018). *TPM 2.0 Library Specification.* TCG Published Standards. https://trustedcomputinggroup.org/resource/tpm-library-specification/
 2. **Birkholz, H., Vigano, I., & Desruisseaux, J.** (2023). *Remote Attestation Procedures (RATS) Architecture.* IETF RFC 9334. https://www.rfc-editor.org/rfc/rfc9334
