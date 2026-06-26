@@ -286,7 +286,7 @@ Following the release of the Steam Deck, Valve engaged in discussions with anti-
 Research in embedded security, such as AsteroidOS (an open-source smart-watch OS), utilizes TPMs and cryptographic measurements to verify device integrity in IoT environments. Our system builds upon these concepts but adapts them to general-purpose Linux environments where system libraries and binaries change dynamically, requiring a Merkle tree approach to aggregate measurements.
 
 ### Remote Attestation Architectures
-Our implementation directly follows the IETF Remote Attestation Procedures (RATS) architecture (RFC 9334) and leverages the TCG Platform Attestation specifications. Academic papers on remote attestation frequently discuss its use in cloud environments to verify virtual machine integrity. Our work translates these enterprise security patterns into the consumer space.
+Our implementation directly follows the IETF Remote Attestation Procedures (RATS) architecture (RFC 9334) and leverages the TCG Platform Attestation specifications. Additionally, Poettering's proposal for a "Brave New Trusted Boot World" outlines an OS-level architecture leveraging Unified Kernel Images (UKIs) and TPM measurements to define a trusted local boot state. Our work builds upon this foundation, translating enterprise remote attestation and trusted boot concepts into client-side application security for consumer gaming.
 
 ### Distributed Systems (petals, exo)
 Modern distributed computing frameworks, such as *petals* and *exo* (which run decentralized machine learning and distributed inference across heterogeneous consumer hardware), face similar trust issues. In these systems, a coordinator must ensure that worker nodes are running genuine, unmodified inference code. The remote attestation design implemented in TPM-Attest can be applied directly to prove worker node integrity in these distributed systems, paving the way for trust beyond gaming.
@@ -346,3 +346,4 @@ Our working proof-of-concept successfully intercepts game anti-cheat calls, gath
 3. **Linux Kernel Organization.** (2021). *Integrity Measurement Architecture (IMA) Templates.* Linux Kernel Documentation. https://www.kernel.org/doc/html/latest/security/IMA-templates.html
 4. **Epic Games.** (2024). *Easy Anti-Cheat Linux SDK Documentation.* Epic Online Services.
 5. **tpm2-software Project.** (2024). *tpm2-tools Command Line Tools for TPM 2.0.* GitHub Repository. https://github.com/tpm2-software/tpm2-tools
+6. **Poettering, L.** (2021). *Brave New Trusted Boot World.* Lennart's Blog. https://0pointer.net/blog/brave-new-trusted-boot-world.html
