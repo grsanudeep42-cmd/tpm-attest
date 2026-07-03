@@ -1,0 +1,148 @@
+# TPM-Attest Security Audit & Academic Evaluation
+
+This report presents a research-grade security audit and conceptual evaluation of the `tpm-attest` proof-of-concept. It is divided into three sections: a file-by-file code audit, a protocol and architectural vulnerability analysis, and an academic critique of the underlying concepts.
+
+---
+
+## 1. File-by-File Code Audit
+
+### `agent/pcr_reader.py`
+1. **Fragile Subprocess Parsing:** The script executes `tpm2_pcrread` and parses the stdout using regular expressions. The output formatting of `tpm2-tools` is not stable across versions (e.g., differences between 4.x and 5.x). Any format change will break the regular expression `_PCR_LINE_RE`, causing runtime errors or silent verification failures.
+2. **Hardcoded PCR Selection:** The indices `[0, 1, 4, 7, 9, 10]` are hardcoded. This restricts compatibility to a specific boot configuration. For instance, systems utilizing systemd-stub or custom boot chains measure command lines and initrd states into PCR 8, 11, or 12, which are ignored here.
+3. **Execution Overhead:** Spawning a subprocess (`tpm2_pcrread`) every time a report is generated is resource-intensive. In a production environment, reading directly from securityfs (e.g., `/sys/class/tpm/tpm0/pcr-sha256/`) or using native Python bindings (e.g., `tpm2-pytss`) would avoid subprocess invocation.
+
+### `agent/ima_reader.py`
+1. **Merkle Tree Duplication Vulnerability (CVE-2012-2459 equivalent):**
+   The Merkle tree is built by duplicating the last node when a layer's node count is odd:
+   ```python
+   if len(current_layer) % 2 == 1:
+       current_layer.append(current_layer[-1])
+   ```
+   This is the exact vulnerability found in the original Bitcoin Merkle tree implementation. An attacker can construct a modified list of IMA log entries that results in the same Merkle root as a clean baseline. For example, the logs `[A, B, C]` and `[A, B, C, C]` will produce identical Merkle roots. An attacker can exploit this to run duplicate executables or alter the log structure without modifying the attested root.
+2. **Fragile String Parsing and File Skipping:** 
+   The parsing splits each line using `line.split(" ", 4)`. If the filename contains multiple spaces or special characters, it may result in incorrect field extraction. More critically, if a line has fewer than 5 fields, it is silently skipped (`continue`). An attacker could deliberately construct files or directories with names that violate this format to execute them without being included in the Merkle tree calculation.
+3. **Privilege Escalation Risk:** 
+   The script invokes `sudo cat` to read `/sys/kernel/security/ima/ascii_runtime_measurements`. This requires configuring passwordless `sudo` access for the client process, introducing a privilege escalation vector. 
+
+### `agent/report.py`
+1. **Insecure Temp Files & Race Conditions:** 
+   The script writes raw quote data to hardcoded paths in `/tmp/` (`quote.msg`, `quote.sig`, and `pcrs.ctx`). This creates a shared-namespace vulnerability:
+   - **Symlink Attacks:** A local attacker could pre-create symlinks pointing to critical system files, causing `tpm2_quote` to overwrite them.
+   - **Local Denial of Service:** A local user can pre-create those files with root-only permissions, causing the agent to crash.
+2. **Insecure Graceful Degradation:** 
+   If `tpm2_quote` fails (e.g., because the persistent handle is not provisioned), the agent falls back to setting `quote_available = False` and returns the un-signed report anyway. Security operations should fail-closed; the client agent should crash or throw an exception rather than returning an unauthenticated report.
+3. **No Attestation Key (AK) Binding:**
+   The report lacks the TPM's Endorsement Key (EK) public key or EK Certificate. Without this, the verifier cannot confirm if the AK belongs to a physical, hardware-rooted TPM or a software simulator.
+
+### `server/main.py`
+1. **Critical Protocol Flaw — Client-Generated Nonces:**
+   The client generates the nonce: `nonce = secrets.token_hex(32)` inside `agent/report.py`. This is a fatal flaw in remote attestation. An attacker can pre-record a valid quote and its corresponding nonce on a clean boot, then replay them later. The server's only protection against this is a 60-second timestamp validation window, which is vulnerable to local clock spoofing or network synchronization manipulation.
+2. **Subprocess Verification Overhead:** 
+   The server invokes `tpm2_checkquote` in a subprocess for every verification. This is highly inefficient for a service meant to scale to thousands of active players and requires the server host to have a full `tpm2-tools` toolchain installed. The signature should be verified natively using Python's cryptographic libraries (e.g., parsing the `TPMS_ATTEST` structure directly).
+3. **State Loss and Lack of Scaling:** 
+   Enrolled keys and pinned baselines are stored in global in-memory dictionaries (`ENROLLED_AK_KEYS` and `KNOWN_GOOD_IMA_ROOT`). Restarting the server wipes all registration state, and the server cannot be scaled horizontally behind a load balancer.
+4. **Unauthenticated Admin Endpoints:** 
+   The `/enroll` and `/register` endpoints have no authentication or access control, allowing any client to overwrite the pinned IMA Merkle root or register malicious AK keys.
+5. **Verification Bypass for Enrolled Keys:**
+   For enrolled keys, the server skips verifying PCR 10 if it is all-zeros:
+   ```python
+   if _is_enrolled_pcr and idx_str == "10":
+       continue
+   ```
+   And it skips the `boot_aggregate` check entirely if `_is_enrolled` is true:
+   ```python
+   if not _is_enrolled and not report.ima_summary.has_boot_aggregate:
+       return "IMA log does not contain boot_aggregate..."
+   ```
+   An attacker who registers their machine can disable IMA in their kernel command line (rendering PCR 10 all-zero and removing `boot_aggregate`). The server will verify the report without executing any integrity checks on the run-time loaded binaries.
+
+### `phase3/eac_hook.c`
+1. **Vulnerable JSON Parsing:**
+   The hook parses the socket response using `strstr` for substring matching:
+   ```c
+   int valid = (strstr(resp_out, "\"valid\":true") != NULL || ...);
+   ```
+   This is vulnerable to basic string injection. If the server returns a failure message containing the text `{"valid": false, "reason": "attestation failed because \"valid\":true was expected"}`, the hook will erroneously detect the `"valid\":true"` substring and approve the session.
+2. **User-Space Bypass:** 
+   Because the hook runs in user space via `LD_PRELOAD`, it is trivial to bypass. An attacker can use `patchelf` to remove the preloaded libraries, modify the game binary's import tables, or load a clean copy of the anti-cheat SDK directly into memory to communicate with the game server, bypassing the hook completely.
+3. **IPC Interception:** 
+   The Unix domain socket path `/tmp/eac_shim.sock` is located in a globally writable directory. A malicious local process can bind to this socket path first, capturing the game client's handshakes.
+
+### `phase3/shim.py`
+1. **Single-Threaded Block:** 
+   The socket server is single-threaded and processes connections sequentially. If the HTTP attestation post takes 15 seconds, any subsequent game client connections will block and timeout.
+
+---
+
+## 2. Protocol and Architectural Flaws
+
+### Replay Attacks via Client-Generated Nonces
+In remote attestation standards (such as IETF RATS RFC 9334), the Verifier must act as the Challenger, generating a random nonce and transmitting it to the Attester. In `tpm-attest`, the client generates the nonce. This permits "replay-on-demand":
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Attacker
+    participant Agent
+    participant TPM
+    participant Verifier
+
+    Note over Attacker, TPM: Attacker boots into a clean system state
+    Attacker->>Agent: Generate report
+    Agent->>TPM: tpm2_quote (with self-generated Nonce A)
+    TPM-->>Agent: Valid Signature A
+    Agent-->>Attacker: Save Report A (Nonce A, Signature A, Clean PCRs)
+    
+    Note over Attacker, TPM: Attacker reboots into tampered system (loaded cheats)
+    Attacker->>Agent: Intercept attestation request
+    Note over Attacker: Attacker modifies system clock to match Report A timestamp
+    Attacker->>Verifier: Send Saved Report A (with spoofed timestamp)
+    Verifier->>Verifier: Check Quote Signature A against Nonce A (valid)
+    Verifier->>Verifier: Check Timestamp (valid due to clock spoofing)
+    Verifier-->>Attacker: Issue Session Token (Bypass Successful!)
+```
+
+### TPM Emulation (Sybil Attacks)
+The verifier does not validate the TPM's Endorsement Key (EK) certificate chain. The EK certificate is signed by the TPM manufacturer's Certificate Authority (CA). Without this validation, an attacker can run the attestation agent inside a virtual machine utilizing a software TPM emulator (e.g., `swtpm`) or a patched TSS library. The emulator can be configured to report a pristine boot configuration (PCRs 0-9) and a clean IMA Merkle root, signing it with a custom virtual key.
+
+### Time-of-Check to Time-of-Use (TOCTOU)
+IMA measures files at the moment they are mapped or executed. It does not provide atomic execution guarantees. In a TOCTOU attack, an attacker can:
+1. Trigger the execution of a clean, whitelisted binary.
+2. The kernel's IMA subsystem reads the binary, hashes it, extends PCR 10, and allows the execution.
+3. The underlying storage layer (e.g., a custom FUSE filesystem or a modified block device) swaps the clean binary's memory pages with malicious code during or immediately after the measurement phase.
+4. The modified binary executes, but the IMA log records the measurement of the clean version.
+
+### Absence of Run-Time Memory Protection
+Remote boot-chain attestation and IMA file measurements are static load-time checks. They do not monitor runtime memory. An attacker can load a clean game client, pass the attestation check at startup, and then use dynamic memory injection techniques (e.g., `ptrace`, `/proc/self/mem` writing, or hardware DMA devices) to inject cheats directly into the running game process.
+
+---
+
+## 3. Conceptual and Academic Critiques
+
+### The Linux Customization Paradox
+The core premise of TPM-Attest is to provide an alternative to invasive kernel-level drivers while maintaining user sovereignty. However, remote attestation relies on verifying that the client's software state matches a known-good configuration.
+- **Strict Whitelisting:** If game publishers enforce a strict policy (pinning PCR 9/10 and the IMA root), only a small set of pre-approved, immutable distributions (e.g., Valve's SteamOS) can run the game. This replicates the platform lock-in of Windows kernel anti-cheats, preventing users from running custom kernels or personal configurations.
+- **User-Defined Baselines:** If the system permits users to enroll their own custom kernels and baselines, the security model fails. An attacker can compile a custom kernel that lies about loaded modules, patches the TPM driver to report arbitrary PCR values, or returns a spoofed IMA measurement log.
+
+### Continuous vs. One-Time Attestation
+TPM-Attest performs a single attestation check during game startup. In competitive game security, this is insufficient. Cheats can be loaded dynamically after the game has launched. 
+To mitigate this, academic systems propose continuous remote attestation (e.g., Keylime), which continuously streams the IMA log to the verifier. However, streaming and verifying every file access on a standard desktop environment introduces significant I/O latency, network overhead, and complexity.
+
+### Enclave-Based Execution (Confidential Computing)
+Modern research points away from verifying the entire host operating system (which is increasingly complex and dynamic on Linux) and instead moves toward isolating the sensitive application itself. 
+By running the game logic or the anti-cheat verification module inside a hardware-secured execution environment (such as AMD SEV-SNP or Intel TDX), the memory space of the application is encrypted and isolated from the host operating system. This prevents a root user or a modified kernel from reading or modifying the game's memory, bypassing the need to verify the host boot configuration or whitelisting every library on the system.
+
+---
+
+## 4. Summary Table of Lacking Features
+
+| Component / Layer | Lacking Feature / Flaw | Impact |
+|:---|:---|:---|
+| **`agent/pcr_reader.py`** | Subprocess regex parsing | High fragility to tool upgrades. |
+| **`agent/ima_reader.py`** | Merkle tree duplicate leaf collision | Potential for log restructuring and collision attacks. |
+| **`agent/report.py`** | Hardcoded `/tmp` paths & insecure degradation | Symlink vulnerabilities and insecure fail-open behavior. |
+| **`server/main.py`** | Client-defined nonces | Permits replay attacks (replay-on-demand). |
+| **`server/main.py`** | No EK Certificate chain validation | Susceptible to virtual machine and software TPM emulation. |
+| **`server/main.py`** | Unauthenticated administration endpoints | Unauthorized baseline resets and key registrations. |
+| **`phase3/eac_hook.c`** | Userspace `LD_PRELOAD` & `strstr` parsing | Trivial to bypass and susceptible to JSON injection. |
+| **Architectural** | Load-time checks only (IMA) | Vulnerable to post-startup runtime memory injection. |
+| **Conceptual** | Strict Whitelisting requirement | Incompatible with general Linux customizability. |

@@ -10,7 +10,7 @@
  * subsequent per-message event.
  *
  * Socket hardening:
- *   • SO_RCVTIMEO = 5 s  (blocking recv cannot hang forever)
+ *   • SO_RCVTIMEO = 30 s  (blocking recv cannot hang forever)
  *   • Fail-closed on every error path
  *   • Debug print at: socket-create, connect, send, recv
  *
@@ -41,6 +41,58 @@ static EOS_MessageCallback g_game_callback  = NULL;
 static fn_AddNotify        g_real_add_notify = NULL;
 static char                g_player_id[256]  = "unknown";
 
+/* ── parse_json_bool ─────────────────────────────────────────────── *
+ * Safely extracts the boolean value of *key* from a JSON string.     *
+ * Scans for "<key>" then skips optional whitespace and a colon,      *
+ * then checks whether the next non-space token is the literal word    *
+ * "true" or "false".                                                  *
+ *                                                                      *
+ * Returns  1 if the value is true,                                    *
+ *          0 if the value is false or the key is absent/malformed.    *
+ *                                                                      *
+ * This prevents string-injection bypasses where attacker-controlled   *
+ * text in an error message body could contain the substring           *
+ * "\"valid\":true" and fool a naive strstr check.                    */
+static int parse_json_bool(const char *json, const char *key)
+{
+    /* Build the search pattern: ""<key>"" */
+    char pattern[128];
+    int plen = snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    if (plen <= 0 || (size_t)plen >= sizeof(pattern))
+        return 0;
+
+    const char *pos = strstr(json, pattern);
+    if (!pos)
+        return 0;
+
+    /* Advance past the key string */
+    pos += plen;
+
+    /* Skip whitespace */
+    while (*pos == ' ' || *pos == '\t' || *pos == '\r' || *pos == '\n')
+        pos++;
+
+    /* Expect a colon */
+    if (*pos != ':')
+        return 0;
+    pos++;
+
+    /* Skip whitespace after colon */
+    while (*pos == ' ' || *pos == '\t' || *pos == '\r' || *pos == '\n')
+        pos++;
+
+    /* Match the literal token "true" (not a substring of something else) */
+    if (strncmp(pos, "true", 4) == 0) {
+        char after = pos[4];
+        /* Must be followed by a JSON delimiter, not more alphanumeric chars */
+        if (after == ',' || after == '}' || after == ' ' || after == '\t'
+                || after == '\r' || after == '\n' || after == '\0')
+            return 1;
+    }
+    return 0;
+}
+
+
 /* ── hex helper ──────────────────────────────────────────────────── */
 static void bytes_to_hex(const unsigned char *data, size_t len,
                           char *out, size_t cap)
@@ -53,8 +105,8 @@ static void bytes_to_hex(const unsigned char *data, size_t len,
 
 /* ── shim_query ──────────────────────────────────────────────────── *
  * Opens a fresh Unix-socket connection, sends json_request, reads   *
- * back the response with a 5-second timeout.                        *
- * Returns 1 if response contains "valid":true, 0 otherwise.         *
+ * back the response with a 30-second timeout.                       *
+ * Returns 1 if "valid" field in response is true, 0 otherwise.      *
  * Prints a debug line at every step so failures are visible.        */
 static int shim_query(const char *json_request,
                        char *resp_out, size_t resp_cap)
@@ -123,9 +175,8 @@ static int shim_query(const char *json_request,
     resp_out[n] = '\0';
     fprintf(stderr, "[HOOK][DBG] recv() OK (%zd bytes): %s\n", n, resp_out);
 
-    /* ── 6. parse "valid" field ── */
-    int valid = (strstr(resp_out, "\"valid\":true")  != NULL ||
-                 strstr(resp_out, "\"valid\": true") != NULL);
+    /* ── 6. parse "valid" field (hardened — no strstr substring injection) ── */
+    int valid = parse_json_bool(resp_out, "valid");
     fprintf(stderr, "[HOOK][DBG] valid=%d\n", valid);
     return valid;
 }

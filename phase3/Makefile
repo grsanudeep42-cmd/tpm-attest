@@ -50,4 +50,4 @@ run-bare: all
 # Assumes the Python shim server is already listening on /tmp/eac_shim.sock.
 run-hooked: all
 	@echo "=== Running fake_game under eac_hook.so ==="
-	LD_PRELOAD=$(PWD)/eac_hook.so ./fake_game
+	LD_PRELOAD=$$PWD/eac_hook.so ./fake_game
